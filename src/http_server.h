@@ -91,12 +91,38 @@ class ServerContext {
 
   IoResponse* CreateFileResponse(HANDLE file);
 
+  IoResponse* CreateRedirectResponse(char* redirectTo);
+
   void PostNewReceive(TP_IO* io);
 
   void ProcessReceiveAndPostResponse(IoRequest* request, TP_IO* io, ULONG result);
 
-protected:
+  std::string GetState() const {
+    return m_state;
+  }
+
+  std::wstring GetStateW() const {
+    return m_stateW;
+  }
+
+  std::string GetCode() {
+    return m_code;
+  }
+
+  bool GetShutdown() const {
+    return m_shutdown;
+  }
+
+ protected:
   virtual ULONG AddUrlsToUrlGroup();
+
+  std::string m_state;
+
+  std::wstring m_stateW;
+
+  std::string m_code;
+
+  bool m_shutdown = {false};
 };
 }  // namespace http
 

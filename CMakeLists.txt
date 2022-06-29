@@ -10,4 +10,4 @@ add_executable(HttpServer src/main.cpp src/http_server.cpp src/http_server.h)
 find_package(spdlog CONFIG REQUIRED)
 
 target_link_libraries(HttpServer PRIVATE spdlog::spdlog_header_only)
-target_link_libraries(HttpServer PRIVATE httpapi.lib)
+target_link_libraries(HttpServer PRIVATE httpapi.lib shlwapi.lib)

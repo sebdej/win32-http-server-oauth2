@@ -1,11 +1,18 @@
 #include "http_server.h"
 
-#include <spdlog/spdlog.h>
+#include <shlwapi.h>
 #include <spdlog/fmt/xchar.h>
+#include <spdlog/spdlog.h>
+
+#include <iostream>
 
 namespace http {
 static int constexpr g_okCode = 200;
 static char g_okReason[] = "OK";
+
+static int constexpr g_badRequestCode = 400;
+static char g_badRequestReason[] = "Bad Request";
+static char g_badRequestMessage[] = "Bad request";
 
 static int constexpr g_fileNotFoundCode = 404;
 static char g_fileNotFoundReason[] = "Not Found";
@@ -86,6 +93,15 @@ static void CALLBACK IoCompletionCallback(PTP_CALLBACK_INSTANCE instance, PVOID 
 bool ServerContext::Start() {
   m_rootDirectory = std::filesystem::current_path();
 
+  GUID guid;
+  if (SUCCEEDED(CoCreateGuid(&guid))) {
+    m_state = fmt::format("{:0>8x}{:0>4x}{:0>4x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}", guid.Data1, guid.Data2, guid.Data3, guid.Data4[0],
+                          guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+
+    m_stateW = fmt::format(L"{:0>8x}{:0>4x}{:0>4x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}{:0>2x}", guid.Data1, guid.Data2, guid.Data3, guid.Data4[0],
+                           guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+  }
+
   ULONG errCode = HttpInitialize(HTTPAPI_VERSION_2, HTTP_INITIALIZE_SERVER, nullptr);
 
   if (errCode == NO_ERROR) {
@@ -113,7 +129,7 @@ bool ServerContext::Start() {
               if (errCode == NO_ERROR) {
                 bool success = true;
 
-                for (int i = 0; i < 16; ++i) {
+                for (int i = 0; i < 4; ++i) {
                   auto request = new IoRequest(this);
 
                   StartThreadpoolIo(m_io);
@@ -220,7 +236,7 @@ ULONG ServerContext::AddUrlsToUrlGroup() {
 
     if (errCode == NO_ERROR) {
       m_listeningPort = port;
-      m_callbackUrl = url;
+      m_callbackUrl = fmt::format(L"http://localhost:{}/auth/code", port);
 
       return errCode;
     }
@@ -230,6 +246,8 @@ ULONG ServerContext::AddUrlsToUrlGroup() {
 }
 
 void ServerContext::Stop() {
+  m_stopServer = true;
+
   ULONG errCode = HttpShutdownRequestQueue(m_requestQueue);
 
   if (errCode != NO_ERROR) {
@@ -345,6 +363,27 @@ IoResponse* ServerContext::CreateFileResponse(HANDLE file) {
   return response;
 }
 
+IoResponse* ServerContext::CreateRedirectResponse(char* redirectTo) {
+  auto const response = new IoResponse(this);
+
+  response->m_httpResponse.StatusCode = 302;
+  response->m_httpResponse.pReason = "Found";
+  response->m_httpResponse.ReasonLength = (USHORT)strlen(response->m_httpResponse.pReason);
+
+  response->m_httpResponse.EntityChunkCount = 0;
+  response->m_httpResponse.pEntityChunks = nullptr;
+
+  auto const contentTypeHeader = &response->m_httpResponse.Headers.KnownHeaders[HttpHeaderContentType];
+  contentTypeHeader->pRawValue = nullptr;
+  contentTypeHeader->RawValueLength = 0;
+
+  auto const locationHeader = &response->m_httpResponse.Headers.KnownHeaders[HttpHeaderLocation];
+  locationHeader->pRawValue = redirectTo;
+  locationHeader->RawValueLength = (USHORT)strlen(locationHeader->pRawValue);
+
+  return response;
+}
+
 //
 // Routine Description:
 //
@@ -387,6 +426,52 @@ void ServerContext::PostNewReceive(PTP_IO io) {
   }
 }
 
+char const* QueryStringNext(char const* qs, char const** name, int* nameLength, char const** value, int* valueLength) {
+  if (!qs || !*qs) {
+    *name = nullptr;
+    *nameLength = 0;
+    *value = nullptr;
+    *valueLength = 0;
+
+    return nullptr;
+  }
+
+  char const* cursor = qs;
+
+  // Le nom
+
+  while (*cursor != '=') {
+    if (*cursor == '\0' || *cursor == '&') {
+      *name = qs;
+      *nameLength = cursor - qs;
+
+      *value = "";
+      *valueLength = 0;
+
+      return cursor;
+    }
+
+    ++cursor;
+  }
+
+  *name = qs;
+  *nameLength = cursor - qs;
+
+  *value = ++cursor;
+
+  while (*cursor != '\0' && *cursor != '&') {
+    ++cursor;
+  }
+
+  *valueLength = cursor - *value;
+
+  if (*cursor == '\0') {
+    return cursor;
+  }
+
+  return cursor + 1;
+}
+
 //
 // Routine Description:
 //
@@ -409,9 +494,10 @@ void ServerContext::PostNewReceive(PTP_IO io) {
 //
 
 void ServerContext::ProcessReceiveAndPostResponse(IoRequest* request, PTP_IO io, ULONG result) {
-  HANDLE file = INVALID_HANDLE_VALUE;
-  HTTP_CACHE_POLICY cachePolicy = {0};
   IoResponse* response = nullptr;
+
+  std::string redirectUrl;
+  bool shutdown = false;
 
   switch (result) {
     case NO_ERROR: {
@@ -420,24 +506,54 @@ void ServerContext::ProcessReceiveAndPostResponse(IoRequest* request, PTP_IO io,
         break;
       }
 
-      auto const filePath = m_rootDirectory / std::filesystem::path(request->m_httpRequest->CookedUrl.pAbsPath + 1);
+      std::string_view path;
+      std::string code, state;
 
-      file = CreateFileW(filePath.native().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (char const* questionMark = strchr(request->m_httpRequest->pRawUrl, '?')) {
+        path = std::string_view(request->m_httpRequest->pRawUrl, questionMark - request->m_httpRequest->pRawUrl);
 
-      if (file == INVALID_HANDLE_VALUE) {
-        if (GetLastError() == ERROR_PATH_NOT_FOUND || GetLastError() == ERROR_FILE_NOT_FOUND) {
-          response = CreateMessageResponse(g_fileNotFoundCode, g_fileNotFoundReason, g_fileNotFoundMessage);
-          break;
+        char const* name = nullptr;
+        int nameLength = 0;
+        char const* value = nullptr;
+        int valueLength = 0;
+
+        char const* cursor = questionMark + 1;
+
+        while (cursor = QueryStringNext(cursor, &name, &nameLength, &value, &valueLength)) {
+          std::cout << "# " << std::string_view(name, nameLength) << ": " << std::string_view(value, valueLength) << std::endl;
+
+          char unescaped[2048];
+          DWORD unescapedLength = sizeof(unescaped);
+
+          HRESULT errCode = UrlUnescapeA((char*)std::string(value, valueLength).c_str(), unescaped, &unescapedLength, 0);
+
+          if (SUCCEEDED(errCode)) {
+            if (!strncmp("code", name, nameLength)) {
+              code = std::string_view(unescaped, unescapedLength);
+            } else if (!strncmp("state", name, nameLength)) {
+              state = std::string_view(unescaped, unescapedLength);
+            }
+          }
         }
-
-        response = CreateMessageResponse(g_fileNotFoundCode, g_fileNotFoundReason, g_fileNotAccessibleMessage);
-        break;
+      } else {
+        path = request->m_httpRequest->pRawUrl;
       }
 
-      response = CreateFileResponse(file);
+      if (!path.compare("/auth/code")) {
+        if (m_state == state) {
+          m_code = code;
 
-      cachePolicy.Policy = HttpCachePolicyUserInvalidates;
-      cachePolicy.SecondsToLive = 0;
+          redirectUrl = fmt::format("http://localhost:{}/shutdown", m_listeningPort);
+
+          response = CreateRedirectResponse((char*)redirectUrl.c_str());
+        } else {
+          response = CreateMessageResponse(g_badRequestCode, g_badRequestReason, g_badRequestMessage);
+        }
+      } else if (!path.compare("/shutdown")) {
+        shutdown = true;
+
+        response = CreateMessageResponse(g_okCode, g_okReason, g_okReason);
+      }
 
       break;
     }
@@ -460,9 +576,8 @@ void ServerContext::ProcessReceiveAndPostResponse(IoRequest* request, PTP_IO io,
 
   StartThreadpoolIo(m_io);
 
-  ULONG errCode =
-      HttpSendHttpResponse(m_requestQueue, request->m_httpRequest->RequestId, 0, &response->m_httpResponse,
-                           file != INVALID_HANDLE_VALUE ? &cachePolicy : nullptr, nullptr, nullptr, 0, &response->m_ioContext.m_overlapped, nullptr);
+  ULONG errCode = HttpSendHttpResponse(m_requestQueue, request->m_httpRequest->RequestId, 0, &response->m_httpResponse, nullptr, nullptr, nullptr, 0,
+                                       &response->m_ioContext.m_overlapped, nullptr);
 
   if (errCode != NO_ERROR && errCode != ERROR_IO_PENDING) {
     CancelThreadpoolIo(m_io);
@@ -471,6 +586,8 @@ void ServerContext::ProcessReceiveAndPostResponse(IoRequest* request, PTP_IO io,
 
     delete response;
   }
+
+  m_shutdown = shutdown;
 }
 
 IoContext::IoContext(ServerContext* serverContext, CompletionFunction completionFunction)
